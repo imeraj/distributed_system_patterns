@@ -9,7 +9,7 @@ defmodule Wal.KVStore do
 
   ## Usage
 
-      {:ok, pid} = Wal.KVStore.start_link(wal_file: "/tmp/kv_store.wal")
+      {:ok, pid} = Wal.KVStore.start_link()
 
       :ok = Wal.KVStore.put(pid, "user:123", "John Doe")
       {:ok, "John Doe"} = Wal.KVStore.get(pid, "user:123")
@@ -19,7 +19,6 @@ defmodule Wal.KVStore do
 
   The GenServer maintains the following state:
   - `data`: A map containing the key-value pairs
-  - `wal_file`: Path to the WAL file
   - `next_index`: Next WAL entry index to use
 
   ## WAL Format

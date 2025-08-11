@@ -23,3 +23,5 @@ wal-*.tar
 /tmp/
 
 *.log
+
+/log/

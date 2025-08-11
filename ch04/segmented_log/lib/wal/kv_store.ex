@@ -9,7 +9,7 @@ defmodule Wal.KVStore do
 
   ## Usage
 
-      {:ok, pid} = Wal.KVStore.start_link(wal_file: "/tmp/kv_store.wal")
+      {:ok, pid} = Wal.KVStore.start_link()
 
       :ok = Wal.KVStore.put(pid, "user:123", "John Doe")
       {:ok, "John Doe"} = Wal.KVStore.get(pid, "user:123")
@@ -19,7 +19,6 @@ defmodule Wal.KVStore do
 
   The GenServer maintains the following state:
   - `data`: A map containing the key-value pairs
-  - `wal_file`: Path to the WAL file
   - `next_index`: Next WAL entry index to use
 
   ## WAL Format
@@ -140,6 +139,60 @@ defmodule Wal.KVStore do
     GenServer.call(server, :get_state)
   end
 
+  @doc """
+  Recovers the KVStore state from a specific WAL index.
+
+  This can be useful for partial recovery scenarios or when you want to
+  rebuild state from a particular point in the WAL history.
+
+  ## Parameters
+  - `server`: The GenServer pid or registered name
+  - `start_index`: The starting index to recover from
+
+  ## Returns
+  - `:ok` on success
+  - `{:error, reason}` on failure
+  """
+  def recover_from_index(server, start_index) do
+    GenServer.call(server, {:recover_from_index, start_index})
+  end
+
+  @doc """
+  Gets information about WAL segments currently in use.
+
+  Returns statistics about the segmented WAL including number of segments,
+  total entries, and current active segment.
+
+  ## Parameters
+  - `server`: The GenServer pid or registered name
+
+  ## Returns
+  - `{:ok, segment_info}` on success
+  - `{:error, reason}` on failure
+
+  ## Examples
+
+      {:ok, info} = Wal.KVStore.get_segment_info(pid)
+      IO.inspect(info.segment_count)
+  """
+  def get_segment_info(server) do
+    GenServer.call(server, :get_segment_info)
+  end
+
+  @doc """
+  Gets the current active segment filename being written to.
+
+  ## Parameters
+  - `server`: The GenServer pid or registered name
+
+  ## Returns
+  - `{:ok, segment_filename}` on success
+  - `{:error, reason}` on failure
+  """
+  def get_current_segment(server) do
+    GenServer.call(server, :get_current_segment)
+  end
+
   # GenServer callbacks
 
   @impl true
@@ -214,24 +267,81 @@ defmodule Wal.KVStore do
     {:reply, state, state}
   end
 
+  @impl true
+  def handle_call({:recover_from_index, start_index}, _from, _state) do
+    # Recover state from specified index
+    {data, next_index} = recover_from_wal(start_index)
+
+    new_state = %{
+      data: data,
+      next_index: next_index
+    }
+
+    {:reply, :ok, new_state}
+  end
+
+  @impl true
+  def handle_call(:get_segment_info, _from, state) do
+    case WAL.get_all_segments_containing_log_greater_than(0) do
+      {:ok, segments} ->
+        segment_info = %{
+          segment_count: length(segments),
+          segments: segments,
+          next_index: state.next_index,
+          data_entries: map_size(state.data)
+        }
+
+        {:reply, {:ok, segment_info}, state}
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
+  end
+
+  @impl true
+  def handle_call(:get_current_segment, _from, state) do
+    case WAL.get_current_segment_filename(state.next_index) do
+      {:ok, segment_filename} ->
+        {:reply, {:ok, segment_filename}, state}
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
+  end
+
   # Private functions
 
   defp recover_from_wal() do
-    case WAL.read_entries() do
+    recover_from_wal(0)
+  end
+
+  defp recover_from_wal(start_index) do
+    case WAL.read_from(start_index) do
       {:ok, entries} ->
         # Replay entries to rebuild state
         data = replay_entries(entries, %{})
-        next_index = length(entries) + 1
+
+        # Calculate next index based on the highest entry index found
+        next_index =
+          case entries do
+            [] ->
+              start_index + 1
+
+            _ ->
+              max_index = Enum.max_by(entries, fn entry -> entry.entry_index end).entry_index
+              max_index + 1
+          end
+
         {data, next_index}
 
       {:error, :enoent} ->
-        # WAL file doesn't exist, start fresh
-        {%{}, 1}
+        # No WAL segments exist, start fresh
+        {%{}, start_index + 1}
 
       {:error, _reason} ->
-        # WAL file exists but can't be read, start fresh
+        # WAL segments exist but can't be read, start fresh
         # In production, you might want to handle this differently
-        {%{}, 1}
+        {%{}, start_index + 1}
     end
   end
 
