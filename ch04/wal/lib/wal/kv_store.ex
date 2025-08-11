@@ -1,0 +1,255 @@
+defmodule Wal.KVStore do
+  use GenServer
+
+  @moduledoc """
+  A key-value store GenServer that persists operations to a Write-Ahead Log (WAL).
+
+  This GenServer maintains an in-memory map of key-value pairs and logs all
+  write operations to a WAL file for durability and crash recovery.
+
+  ## Usage
+
+      {:ok, pid} = Wal.KVStore.start_link(wal_file: "/tmp/kv_store.wal")
+
+      :ok = Wal.KVStore.put(pid, "user:123", "John Doe")
+      {:ok, "John Doe"} = Wal.KVStore.get(pid, "user:123")
+      {:error, :not_found} = Wal.KVStore.get(pid, "nonexistent")
+
+  ## State
+
+  The GenServer maintains the following state:
+  - `data`: A map containing the key-value pairs
+  - `wal_file`: Path to the WAL file
+  - `next_index`: Next WAL entry index to use
+
+  ## WAL Format
+
+  Each PUT operation is logged to the WAL as:
+  - Entry type: `:set`
+  - Data: Serialized `{:set, key, value}` tuple
+  - Index: Monotonically increasing integer
+  """
+
+  alias Wal.WAL
+
+  # Client API
+
+  @doc """
+  Starts the KVStore GenServer.
+
+  ## Options
+  - `:name` - Name to register the GenServer (optional)
+
+  ## Examples
+
+      {:ok, pid} = Wal.KVStore.start_link()
+      {:ok, pid} = Wal.KVStore.start_link(name: :my_store)
+
+  """
+  def start_link(opts \\ []) do
+    name = Keyword.get(opts, :name, __MODULE__)
+    GenServer.start_link(__MODULE__, opts, name: name)
+  end
+
+  @doc """
+  Retrieves a value by key.
+
+  ## Parameters
+  - `server`: The GenServer pid or registered name
+  - `key`: The key to look up
+
+  ## Returns
+  - `{:ok, value}` if key exists
+  - `{:error, :not_found}` if key doesn't exist
+
+  ## Examples
+
+      {:ok, "John Doe"} = Wal.KVStore.get(pid, "user:123")
+      {:error, :not_found} = Wal.KVStore.get(pid, "missing_key")
+
+  """
+  def get(server, key) do
+    GenServer.call(server, {:get, key})
+  end
+
+  @doc """
+  Stores a key-value pair.
+
+  This operation is first logged to the WAL before updating the in-memory state.
+
+  ## Parameters
+  - `server`: The GenServer pid or registered name
+  - `key`: The key to store
+  - `value`: The value to store
+
+  ## Returns
+  - `:ok` on success
+  - `{:error, reason}` on failure
+
+  ## Examples
+
+      :ok = Wal.KVStore.put(pid, "user:123", "John Doe")
+      :ok = Wal.KVStore.put(pid, "config:timeout", "30000")
+
+  """
+  def put(server, key, value) do
+    GenServer.call(server, {:put, key, value})
+  end
+
+  @doc """
+  Stores multiple key-value pairs in a batch operation.
+
+  This operation writes all entries to the WAL in a single batch before
+  updating the in-memory state, providing better performance and atomicity
+  for multiple operations.
+
+  ## Parameters
+  - `server`: The GenServer pid or registered name
+  - `key_value_pairs`: List of {key, value} tuples to store
+
+  ## Returns
+  - `:ok` on success
+  - `{:error, reason}` on failure
+
+  ## Examples
+
+      pairs = [{"user:123", "John"}, {"user:124", "Jane"}]
+      :ok = Wal.KVStore.put_batch(pid, pairs)
+
+  """
+  def put_batch(server, key_value_pairs) do
+    GenServer.call(server, {:put_batch, key_value_pairs})
+  end
+
+  @doc """
+  Returns the current state of the KVStore for debugging/inspection.
+
+  ## Parameters
+  - `server`: The GenServer pid or registered name
+
+  ## Returns
+  - `%{data: map(), next_index: integer()}`
+
+  ## Examples
+
+      state = Wal.KVStore.get_state(pid)
+      IO.inspect(state.data)
+
+  """
+  def get_state(server) do
+    GenServer.call(server, :get_state)
+  end
+
+  # GenServer callbacks
+
+  @impl true
+  def init(_opts) do
+    # Recover state from WAL file if it exists
+    {data, next_index} = recover_from_wal()
+
+    state = %{
+      data: data,
+      next_index: next_index
+    }
+
+    {:ok, state}
+  end
+
+  @impl true
+  def handle_call({:get, key}, _from, state) do
+    case Map.get(state.data, key) do
+      nil -> {:reply, {:error, :not_found}, state}
+      value -> {:reply, {:ok, value}, state}
+    end
+  end
+
+  @impl true
+  def handle_call({:put, key, value}, _from, state) do
+    # Create WAL entry
+    wal_entry =
+      WAL.create_entry(state.next_index, :erlang.term_to_binary({:set, key, value}), :set)
+
+    case WAL.write_entry(wal_entry) do
+      :ok ->
+        # Update in-memory state only after successful WAL write
+        new_data = Map.put(state.data, key, value)
+        new_state = %{state | data: new_data, next_index: state.next_index + 1}
+        {:reply, :ok, new_state}
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
+  end
+
+  @impl true
+  def handle_call({:put_batch, key_value_pairs}, _from, state) do
+    # Create WAL entries for all key-value pairs
+    wal_entries =
+      key_value_pairs
+      |> Enum.with_index()
+      |> Enum.map(fn {{key, value}, index} ->
+        entry_index = state.next_index + index
+        WAL.create_entry(entry_index, :erlang.term_to_binary({:set, key, value}), :set)
+      end)
+
+    case WAL.write_entries(wal_entries) do
+      :ok ->
+        # Update in-memory state only after successful WAL write
+        new_data =
+          Enum.reduce(key_value_pairs, state.data, fn {key, value}, acc ->
+            Map.put(acc, key, value)
+          end)
+
+        new_next_index = state.next_index + length(key_value_pairs)
+        new_state = %{state | data: new_data, next_index: new_next_index}
+        {:reply, :ok, new_state}
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
+  end
+
+  @impl true
+  def handle_call(:get_state, _from, state) do
+    {:reply, state, state}
+  end
+
+  # Private functions
+
+  defp recover_from_wal() do
+    case WAL.read_entries() do
+      {:ok, entries} ->
+        # Replay entries to rebuild state
+        data = replay_entries(entries, %{})
+        next_index = length(entries) + 1
+        {data, next_index}
+
+      {:error, :enoent} ->
+        # WAL file doesn't exist, start fresh
+        {%{}, 1}
+
+      {:error, _reason} ->
+        # WAL file exists but can't be read, start fresh
+        # In production, you might want to handle this differently
+        {%{}, 1}
+    end
+  end
+
+  defp replay_entries([], data), do: data
+
+  defp replay_entries([entry | rest], data) do
+    new_data =
+      try do
+        case :erlang.binary_to_term(entry.data) do
+          {:set, key, value} -> Map.put(data, key, value)
+          # Skip invalid entries
+          _ -> data
+        end
+      rescue
+        # Skip corrupted entries
+        _ -> data
+      end
+
+    replay_entries(rest, new_data)
+  end
+end
