@@ -38,16 +38,19 @@ defmodule Wal.KVStore do
 
   ## Options
   - `:name` - Name to register the GenServer (optional)
+  - `:wal` - WAL GenServer pid or name (required)
 
   ## Examples
 
-      {:ok, pid} = Wal.KVStore.start_link()
-      {:ok, pid} = Wal.KVStore.start_link(name: :my_store)
+      {:ok, wal_pid} = Wal.WAL.start_link([])
+      {:ok, pid} = Wal.KVStore.start_link(wal: wal_pid)
+      {:ok, pid} = Wal.KVStore.start_link(name: :my_store, wal: wal_pid)
 
   """
   def start_link(opts \\ []) do
     name = Keyword.get(opts, :name, __MODULE__)
-    GenServer.start_link(__MODULE__, opts, name: name)
+    wal = Keyword.fetch!(opts, :wal)
+    GenServer.start_link(__MODULE__, %{wal: wal}, name: name)
   end
 
   @doc """
@@ -196,13 +199,14 @@ defmodule Wal.KVStore do
   # GenServer callbacks
 
   @impl true
-  def init(_opts) do
-    # Recover state from WAL file if it exists
-    {data, next_index} = recover_from_wal()
+  def init(%{wal: wal} = _opts) do
+    # Recover state from WAL GenServer if it exists
+    {data, next_index} = recover_from_wal(wal)
 
     state = %{
       data: data,
-      next_index: next_index
+      next_index: next_index,
+      wal: wal
     }
 
     {:ok, state}
@@ -222,7 +226,7 @@ defmodule Wal.KVStore do
     wal_entry =
       WAL.create_entry(state.next_index, :erlang.term_to_binary({:set, key, value}), :set)
 
-    case WAL.write_entry(wal_entry) do
+    case WAL.write_entry(state.wal, wal_entry) do
       :ok ->
         # Update in-memory state only after successful WAL write
         new_data = Map.put(state.data, key, value)
@@ -245,7 +249,7 @@ defmodule Wal.KVStore do
         WAL.create_entry(entry_index, :erlang.term_to_binary({:set, key, value}), :set)
       end)
 
-    case WAL.write_entries(wal_entries) do
+    case WAL.write_entries(state.wal, wal_entries) do
       :ok ->
         # Update in-memory state only after successful WAL write
         new_data =
@@ -268,13 +272,14 @@ defmodule Wal.KVStore do
   end
 
   @impl true
-  def handle_call({:recover_from_index, start_index}, _from, _state) do
+  def handle_call({:recover_from_index, start_index}, _from, state) do
     # Recover state from specified index
-    {data, next_index} = recover_from_wal(start_index)
+    {data, next_index} = recover_from_wal(state.wal, start_index)
 
     new_state = %{
       data: data,
-      next_index: next_index
+      next_index: next_index,
+      wal: state.wal
     }
 
     {:reply, :ok, new_state}
@@ -282,7 +287,7 @@ defmodule Wal.KVStore do
 
   @impl true
   def handle_call(:get_segment_info, _from, state) do
-    case WAL.get_all_segments_containing_log_greater_than(0) do
+    case WAL.get_all_segments_containing_log_greater_than(state.wal, 0) do
       {:ok, segments} ->
         segment_info = %{
           segment_count: length(segments),
@@ -300,7 +305,7 @@ defmodule Wal.KVStore do
 
   @impl true
   def handle_call(:get_current_segment, _from, state) do
-    case WAL.get_current_segment_filename(state.next_index) do
+    case WAL.get_current_segment_filename(state.wal, state.next_index) do
       {:ok, segment_filename} ->
         {:reply, {:ok, segment_filename}, state}
 
@@ -311,12 +316,8 @@ defmodule Wal.KVStore do
 
   # Private functions
 
-  defp recover_from_wal() do
-    recover_from_wal(0)
-  end
-
-  defp recover_from_wal(start_index) do
-    case WAL.read_from(start_index) do
+  defp recover_from_wal(wal, start_index \\ 0) do
+    case WAL.read_from(wal, start_index) do
       {:ok, entries} ->
         # Replay entries to rebuild state
         data = replay_entries(entries, %{})
