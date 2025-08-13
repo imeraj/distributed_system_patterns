@@ -230,7 +230,9 @@ defmodule Wal.KVStore do
       :ok ->
         # Update in-memory state only after successful WAL write
         new_data = Map.put(state.data, key, value)
-        new_state = %{state | data: new_data, next_index: state.next_index + 1}
+        new_next_index = state.next_index + 1
+        WAL.set_last_index(state.wal, new_next_index - 1)
+        new_state = %{state | data: new_data, next_index: new_next_index}
         {:reply, :ok, new_state}
 
       {:error, reason} ->
@@ -258,6 +260,7 @@ defmodule Wal.KVStore do
           end)
 
         new_next_index = state.next_index + length(key_value_pairs)
+        WAL.set_last_index(state.wal, new_next_index - 1)
         new_state = %{state | data: new_data, next_index: new_next_index}
         {:reply, :ok, new_state}
 
@@ -332,6 +335,9 @@ defmodule Wal.KVStore do
               max_index = Enum.max_by(entries, fn entry -> entry.entry_index end).entry_index
               max_index + 1
           end
+
+        # Set last_index in WAL after reading
+        WAL.set_last_index(wal, next_index - 1)
 
         {data, next_index}
 

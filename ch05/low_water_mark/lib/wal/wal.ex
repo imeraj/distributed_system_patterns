@@ -160,18 +160,19 @@ defmodule Wal.WAL do
 
   @impl true
   def init(_opts) do
-    # Initial state: no cached state needed.
     # Discover all segment files on startup and sort them
-    case discover_segment_files() do
-      {:ok, segments} ->
-        sorted_segments = Enum.sort_by(segments, fn {_filename, offset} -> offset end)
-        state = %{sorted_saved_segments: sorted_segments}
-        {:ok, state}
+    state =
+      case discover_segment_files() do
+        {:ok, segments} ->
+          sorted_segments = Enum.sort_by(segments, fn {_filename, offset} -> offset end)
+          %{sorted_saved_segments: sorted_segments, last_index: 0}
 
-      {:error, _reason} ->
-        state = %{sorted_saved_segments: []}
-        {:ok, state}
-    end
+        {:error, _reason} ->
+          %{sorted_saved_segments: [], last_index: 0}
+      end
+
+    scheduleLogCleaning()
+    {:ok, state}
   end
 
   @impl true
@@ -362,6 +363,62 @@ defmodule Wal.WAL do
         latest = Enum.max_by(segments, fn {_filename, offset} -> offset end)
         {:ok, latest}
     end
+  end
+
+  # API for KVStore to update last_index
+  def set_last_index(server, index) do
+    GenServer.cast(server, {:set_last_index, index})
+  end
+
+  @impl true
+  def handle_cast({:set_last_index, index}, state) do
+    {:noreply, %{state | last_index: index}}
+  end
+
+  # Schedules the next log cleaning event in 5s
+  defp scheduleLogCleaning() do
+    Process.send_after(self(), :cleanup_logs, 5000)
+  end
+
+  # Handles the periodic cleanup message
+  @impl true
+  def handle_info(:cleanup_logs, state) do
+    new_state = cleanup_logs(state)
+    scheduleLogCleaning()
+    {:noreply, new_state}
+  end
+
+  # Cleanup function for log segments (stub, implement logic as needed)
+  defp cleanup_logs(state) do
+    segments_to_deleted = get_segments_to_be_deleted(state)
+
+    Enum.reduce(segments_to_deleted, state, fn {segment_filename, _base_offset}, acc_state ->
+      updated_segments =
+        Enum.reject(acc_state.sorted_saved_segments, fn {fname, _} ->
+          fname == segment_filename
+        end)
+
+      File.rm(segment_filename)
+      %{acc_state | sorted_saved_segments: updated_segments}
+    end)
+  end
+
+  # Returns a list of segments to be deleted based on last_index
+  defp get_segments_to_be_deleted(state) do
+    get_segments_before(state, state.last_index)
+  end
+
+  # Returns segments whose base offset is less than snapshot_index,
+  # but never deletes the last (most recent) segment.
+  defp get_segments_before(state, snapshot_index) do
+    segments = state.sorted_saved_segments
+
+    # Exclude the last segment (most recent)
+    segments_to_check = Enum.drop(segments, -1)
+
+    Enum.filter(segments_to_check, fn {_segment_filename, base_offset} ->
+      base_offset < snapshot_index
+    end)
   end
 
   # Should create new segment?
